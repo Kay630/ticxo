@@ -534,13 +534,131 @@ input.field.o-focus:focus{border-color:var(--o)}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
 /* ═══════════════════════════════════════════════
-   RESPONSIVE
+   RESPONSIVE — MOBILE FIRST
 ═══════════════════════════════════════════════ */
+
+/* ── Prevent iOS input zoom (font-size must be ≥16px on inputs) ── */
+input.field, textarea.field, .chat-input, .lobby-input {
+  font-size: 16px !important;
+}
+
+/* ── Tablet (≤768px) ── */
+@media(max-width:768px){
+  /* Nav: shrink user pill, hide text labels, keep icons */
+  .nav-user span:last-child { display:none }
+  .nav-btn { padding:7px 10px; font-size:.78rem }
+
+  /* Home: tighten vertical gaps */
+  #home { padding:24px 16px; gap:28px }
+  .mode-grid { gap:10px }
+
+  /* Game: less vertical padding so board fits without scrolling */
+  #game { padding:16px 12px; gap:12px }
+
+  /* Board cells: use more of the viewport width */
+  .cell { width: clamp(90px, 28vw, 128px) }
+
+  /* Scoreboard: tighten */
+  .scoreboard { padding:10px 16px; gap:12px }
+  .sc-num { font-size:1.4rem }
+
+  /* Controls: shrink text slightly */
+  .ctrl { padding:8px 12px; font-size:.78rem }
+
+  /* Leaderboard table: allow horizontal scroll */
+  #leaderboard { padding:24px 12px }
+  .lb-inner { overflow-x:auto }
+  .lb-table th, .lb-row td { padding:10px 10px }
+}
+
+/* ── Phone (≤480px) ── */
 @media(max-width:480px){
-  nav{padding:14px 16px}
-  .auth-card,.setup-card,.lobby-card,.profile-card{padding:24px}
-  .mode-grid{grid-template-columns:1fr}
-  .chat-wrap{max-width:100%}
+  /* Nav: compact, no overflow */
+  nav { padding:12px 14px }
+  .nav-user { padding:5px 10px 5px 7px; font-size:.8rem }
+  .nav-btn { padding:6px 9px; font-size:.76rem }
+
+  /* Auth: less breathing room on short screens */
+  #auth { padding:20px 14px }
+  .auth-card { padding:20px }
+  .auth-hero h1 { font-size:clamp(2.2rem,10vw,3rem) }
+  .auth-hero p { font-size:.85rem }
+  .av-btn { width:40px; height:40px; font-size:1.15rem }
+
+  /* Home */
+  #home { padding:20px 14px; gap:24px }
+  .home-hero h2 { font-size:clamp(1.5rem,6vw,2rem) }
+  .mode-grid { grid-template-columns:1fr; gap:10px }
+  .mode-card { padding:20px 18px }
+  .mode-icon { font-size:2rem; margin-bottom:8px }
+
+  /* Setup / Lobby */
+  .setup-card, .lobby-card, .profile-card { padding:20px }
+  #setup, #lobby { padding:20px 14px; gap:16px }
+  .setup-title, .lobby-title { font-size:1.3rem }
+
+  /* Game screen — optimise for one-thumb play */
+  #game { padding:10px 10px; gap:10px }
+
+  /* Player name tags: go smaller */
+  .ptag { padding:7px 12px; gap:7px }
+  .ptag-name { font-size:.78rem }
+  .ptag-score { font-size:.68rem }
+  .vs-sep { font-size:.7rem }
+
+  /* Board: fill the screen width, square cells */
+  .board { gap:7px; padding:7px; border-radius:16px }
+  .cell {
+    width: clamp(80px, calc((100vw - 80px) / 3), 120px);
+    border-radius:10px;
+    font-size: clamp(1.6rem, 8vw, 2.8rem);
+  }
+
+  /* Result overlay text */
+  .result-msg { font-size:1.1rem }
+  .result-icon { font-size:2.2rem }
+  .result-btns { flex-direction:column; align-items:center; gap:8px; width:100%; padding:0 16px }
+  .result-btns .btn { width:100%; justify-content:center }
+
+  /* Scoreboard */
+  .scoreboard { padding:9px 14px; gap:10px }
+  .sc-num { font-size:1.3rem }
+  .sc-lbl { font-size:.6rem }
+
+  /* Controls: wrap tightly */
+  .game-controls { gap:6px }
+  .ctrl { padding:7px 11px; font-size:.75rem }
+
+  /* Chat */
+  .chat-wrap { max-width:100% }
+  .chat-msgs { height:100px }
+
+  /* Leaderboard */
+  #leaderboard { padding:20px 12px }
+  .page-title { font-size:1.5rem }
+  /* Hide draws column on very small screens */
+  .lb-draws, .lb-table th:last-child { display:none }
+  .lb-row td { padding:10px 8px; font-size:.82rem }
+
+  /* Profile */
+  #profile { padding:20px 14px }
+  .profile-card { padding:20px }
+  .profile-av { font-size:2.8rem }
+  .profile-name { font-size:1.3rem }
+  .stat-val { font-size:1.5rem }
+
+  /* Toast stays above iOS home indicator */
+  #toast { bottom:32px; font-size:.82rem; padding:10px 18px }
+}
+
+/* ── Very small phones (≤360px) ── */
+@media(max-width:360px){
+  .cell {
+    width: calc((100vw - 70px) / 3);
+    font-size: 7vw;
+  }
+  .ptag-name { max-width:70px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .nav-btn:not(.primary) { display:none } /* keep only Sign In / primary action */
 }
 </style>
 </head>
