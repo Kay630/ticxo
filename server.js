@@ -1,6 +1,7 @@
 /**
  * TicXO — Production-ready server
  * Works locally AND on Railway, Render, Heroku, Fly.io etc.
+ * Dependencies: express, socket.io only (built-in crypto handles passwords)
  */
 
 const express    = require('express');
@@ -9,8 +10,40 @@ const { Server } = require('socket.io');
 const path       = require('path');
 const fs         = require('fs');
 const crypto     = require('crypto');
-const bcrypt     = require('bcryptjs'); // pure-JS build, no native compilation needed
-const rateLimit  = require('express-rate-limit');
+
+// ─── Password helpers (PBKDF2 — built into Node, no extra packages) ───────────
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex');
+  return `pbkdf2:${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  if (stored.startsWith('pbkdf2:')) {
+    const [, salt, hash] = stored.split(':');
+    const attempt = crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex');
+    // timingSafeEqual prevents timing attacks
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(attempt, 'hex'));
+  }
+  // Legacy SHA-256 accounts (migrate on next login)
+  const sha = crypto.createHash('sha256').update(password).digest('hex');
+  return sha === stored;
+}
+
+// ─── Simple in-memory rate limiter (no external package needed) ───────────────
+const _rateBuckets = {};
+function rateLimiter(maxHits, windowMs) {
+  return (req, res, next) => {
+    const key = req.ip + req.path;
+    const now = Date.now();
+    if (!_rateBuckets[key]) _rateBuckets[key] = [];
+    _rateBuckets[key] = _rateBuckets[key].filter(t => now - t < windowMs);
+    if (_rateBuckets[key].length >= maxHits)
+      return res.status(429).json({ error: 'Too many attempts. Please wait and try again.' });
+    _rateBuckets[key].push(now);
+    next();
+  };
+}
+const authLimiter = rateLimiter(20, 15 * 60 * 1000);
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -19,8 +52,8 @@ const IS_CLOUD = !!process.env.RAILWAY_ENVIRONMENT ||
                  !!process.env.RENDER               ||
                  !!process.env.DYNO;
 
-const DATA_DIR  = IS_CLOUD ? '/tmp' : path.join(__dirname, 'data');
-const DB_FILE   = path.join(DATA_DIR, 'users.json');
+const DATA_DIR = IS_CLOUD ? '/tmp' : path.join(__dirname, 'data');
+const DB_FILE  = path.join(DATA_DIR, 'users.json');
 
 // ─── App setup ───────────────────────────────────────────────────────────────
 const app    = express();
@@ -37,15 +70,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
-// ─── Rate limiters ────────────────────────────────────────────────────────────
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  message: { error: 'Too many attempts. Please wait 15 minutes.' },
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
 // ─── Persistence helpers ─────────────────────────────────────────────────────
 function loadDB() {
   try {
@@ -57,23 +81,19 @@ function loadDB() {
     return { users: {} };
   }
 }
-
 function saveDB(db) {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-  } catch (e) {
-    console.error('DB save error:', e.message);
-  }
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+  catch (e) { console.error('DB save error:', e.message); }
 }
 
 // ─── In-memory game state ─────────────────────────────────────────────────────
-const rooms             = {};   // { [code]: room }
-const sessions          = {};   // { [socketId]: session }
-const pendingReconnects = {};   // { [userId]: { code, symbol } }
-const disconnectTimers  = {};   // { [userId]: timeoutId }
+const rooms             = {};
+const sessions          = {};
+const pendingReconnects = {};
+const disconnectTimers  = {};
 
 const RECONNECT_GRACE_MS = 15000;
-const ROOM_WAIT_MS       = 5 * 60 * 1000; // 5 minutes for Player 2 to join
+const ROOM_WAIT_MS       = 5 * 60 * 1000;
 
 function makeRoom(code, p1) {
   return {
@@ -85,7 +105,7 @@ function makeRoom(code, p1) {
     scores:       { X: 0, O: 0, D: 0 },
     round:        1,
     rematchVotes: new Set(),
-    waitTimeout:  null  // cleared when P2 joins; fires after ROOM_WAIT_MS if still empty
+    waitTimeout:  null
   };
 }
 
@@ -105,15 +125,14 @@ function checkWinner(board) {
 }
 
 function cleanupRoom(code, notifyPayload) {
-  const room = rooms[code];
-  if (!room) return;
+  if (!rooms[code]) return;
   if (notifyPayload) io.to(code).emit('opponent_left', notifyPayload);
   delete rooms[code];
   console.log(`Room ${code} deleted`);
 }
 
 // ─── REST: Auth ───────────────────────────────────────────────────────────────
-app.post('/api/signup', authLimiter, async (req, res) => {
+app.post('/api/signup', authLimiter, (req, res) => {
   const { username, password, avatar } = req.body;
 
   if (!username || !password)
@@ -131,32 +150,26 @@ app.post('/api/signup', authLimiter, async (req, res) => {
   if (db.users[key])
     return res.status(409).json({ error: 'Username already taken' });
 
-  try {
-    const hash = await bcrypt.hash(password, 12);
-    db.users[key] = {
-      username:  trimmed,
-      password:  hash,
-      avatar:    avatar || '🎮',
-      wins:      0,
-      losses:    0,
-      draws:     0,
-      createdAt: Date.now()
-    };
-    saveDB(db);
-    const { password: _, ...safe } = db.users[key];
-    res.json({ user: { ...safe, id: key } });
-  } catch (e) {
-    console.error('Signup error:', e.message);
-    res.status(500).json({ error: 'Server error. Try again.' });
-  }
+  db.users[key] = {
+    username:  trimmed,
+    password:  hashPassword(password),
+    avatar:    avatar || '🎮',
+    wins:      0,
+    losses:    0,
+    draws:     0,
+    createdAt: Date.now()
+  };
+  saveDB(db);
+
+  const { password: _, ...safe } = db.users[key];
+  res.json({ user: { ...safe, id: key } });
 });
 
-app.post('/api/login', authLimiter, async (req, res) => {
+app.post('/api/login', authLimiter, (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password)
     return res.status(400).json({ error: 'Fill in all fields' });
-
   if (username.trim().length > 24 || password.length > 128)
     return res.status(400).json({ error: 'Invalid credentials' });
 
@@ -167,45 +180,24 @@ app.post('/api/login', authLimiter, async (req, res) => {
   if (!user)
     return res.status(401).json({ error: 'User not found' });
 
-  try {
-    let match = false;
-    const isBcrypt = user.password.startsWith('$2');
+  if (!verifyPassword(password, user.password))
+    return res.status(401).json({ error: 'Wrong password' });
 
-    if (isBcrypt) {
-      match = await bcrypt.compare(password, user.password);
-    } else {
-      // Legacy SHA-256 — migrate to bcrypt on first successful login
-      const sha = crypto.createHash('sha256').update(password).digest('hex');
-      match = sha === user.password;
-      if (match) {
-        user.password = await bcrypt.hash(password, 12);
-        saveDB(db);
-        console.log(`Migrated ${key} password to bcrypt`);
-      }
-    }
-
-    if (!match)
-      return res.status(401).json({ error: 'Wrong password' });
-
-    const { password: _, ...safe } = user;
-    res.json({ user: { ...safe, id: key } });
-  } catch (e) {
-    console.error('Login error:', e.message);
-    res.status(500).json({ error: 'Server error. Try again.' });
+  // Migrate legacy SHA-256 hash to PBKDF2 on first successful login
+  if (!user.password.startsWith('pbkdf2:')) {
+    user.password = hashPassword(password);
+    saveDB(db);
+    console.log(`Migrated ${key} to PBKDF2`);
   }
+
+  const { password: _, ...safe } = user;
+  res.json({ user: { ...safe, id: key } });
 });
 
 app.get('/api/leaderboard', (_req, res) => {
-  const db    = loadDB();
+  const db = loadDB();
   const board = Object.entries(db.users)
-    .map(([id, u]) => ({
-      id,
-      username: u.username,
-      avatar:   u.avatar,
-      wins:     u.wins,
-      losses:   u.losses,
-      draws:    u.draws
-    }))
+    .map(([id, u]) => ({ id, username: u.username, avatar: u.avatar, wins: u.wins, losses: u.losses, draws: u.draws }))
     .sort((a, b) => b.wins - a.wins || a.losses - b.losses)
     .slice(0, 20);
   res.json({ leaderboard: board });
@@ -219,7 +211,7 @@ io.on('connection', (socket) => {
     sessions[socket.id] = { userId, username, roomCode: null, symbol: null };
     socket.emit('auth_ok', { socketId: socket.id });
 
-    // ── Reconnect: restore player to their room if within grace period ──
+    // Reconnect within grace period
     if (userId && userId !== 'guest' && pendingReconnects[userId]) {
       clearTimeout(disconnectTimers[userId]);
       delete disconnectTimers[userId];
@@ -232,10 +224,8 @@ io.on('connection', (socket) => {
         sessions[socket.id] = { userId, username, roomCode: code, symbol };
         room.players[symbol] = { socketId: socket.id, userId, username };
         socket.join(code);
-
         socket.emit('reconnected', {
-          code,
-          symbol,
+          code, symbol,
           board:    room.board,
           current:  room.current,
           scores:   room.scores,
@@ -246,7 +236,6 @@ io.on('connection', (socket) => {
             O: { username: room.players.O?.username, userId: room.players.O?.userId }
           }
         });
-
         socket.to(code).emit('opponent_reconnected', { username });
         console.log(`${username} reconnected to room ${code}`);
       }
@@ -259,22 +248,20 @@ io.on('connection', (socket) => {
     Object.assign(session, { userId, username });
     sessions[socket.id] = session;
 
-    // Generate a guaranteed 4-character alphanumeric code
-    const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I to avoid confusion
+    const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code;
     do {
-      code = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+      code = Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
     } while (rooms[code]);
 
     const room = makeRoom(code, { socketId: socket.id, userId, username });
     rooms[code] = room;
 
-    // Room expires in 5 minutes if Player 2 never joins
     room.waitTimeout = setTimeout(() => {
       if (rooms[code] && !rooms[code].players.O) {
         socket.emit('room_expired', { code });
         delete rooms[code];
-        console.log(`Room ${code} expired (no opponent joined within 5 min)`);
+        console.log(`Room ${code} expired`);
       }
     }, ROOM_WAIT_MS);
 
@@ -299,12 +286,10 @@ io.on('connection', (socket) => {
     sessions[socket.id] = session;
 
     room.players.O = { socketId: socket.id, userId, username };
-    // Cancel the waiting-room expiry — both players are now in
     if (room.waitTimeout) { clearTimeout(room.waitTimeout); room.waitTimeout = null; }
     socket.join(upperCode);
 
     socket.emit('room_joined', { code: upperCode, symbol: 'O' });
-
     io.to(upperCode).emit('game_start', {
       players: {
         X: { username: room.players.X.username, userId: room.players.X.userId },
@@ -329,13 +314,11 @@ io.on('connection', (socket) => {
 
     if (result) {
       room.gameOver = true;
-
       if (result.winner) {
         room.scores[result.winner]++;
-        const db         = loadDB();
-        const winSym     = result.winner;
-        const loseSym    = winSym === 'X' ? 'O' : 'X';
-        const winPlayer  = room.players[winSym];
+        const db = loadDB();
+        const winPlayer  = room.players[result.winner];
+        const loseSym    = result.winner === 'X' ? 'O' : 'X';
         const losePlayer = room.players[loseSym];
         if (winPlayer?.userId  && db.users[winPlayer.userId])  db.users[winPlayer.userId].wins++;
         if (losePlayer?.userId && db.users[losePlayer.userId]) db.users[losePlayer.userId].losses++;
@@ -343,29 +326,17 @@ io.on('connection', (socket) => {
       } else {
         room.scores.D++;
         const db = loadDB();
-        for (const sym of ['X','O']) {
+        for (const sym of ['X', 'O']) {
           const p = room.players[sym];
           if (p?.userId && db.users[p.userId]) db.users[p.userId].draws++;
         }
         saveDB(db);
       }
-
-      io.to(session.roomCode).emit('move_made', {
-        index, symbol: session.symbol, board: room.board
-      });
-      io.to(session.roomCode).emit('game_over', {
-        winner: result.winner,
-        line:   result.line || null,
-        scores: room.scores,
-        round:  room.round
-      });
-
+      io.to(session.roomCode).emit('move_made', { index, symbol: session.symbol, board: room.board });
+      io.to(session.roomCode).emit('game_over', { winner: result.winner, line: result.line || null, scores: room.scores, round: room.round });
     } else {
       room.current = room.current === 'X' ? 'O' : 'X';
-      io.to(session.roomCode).emit('move_made', {
-        index, symbol: session.symbol,
-        board: room.board, next: room.current
-      });
+      io.to(session.roomCode).emit('move_made', { index, symbol: session.symbol, board: room.board, next: room.current });
     }
   });
 
@@ -380,14 +351,12 @@ io.on('connection', (socket) => {
     io.to(session.roomCode).emit('rematch_vote', { count: room.rematchVotes.size });
 
     if (room.rematchVotes.size >= 2) {
-      room.board        = Array(9).fill(null);
-      room.current      = 'X';
-      room.gameOver     = false;
+      room.board = Array(9).fill(null);
+      room.current = 'X';
+      room.gameOver = false;
       room.round++;
       room.rematchVotes.clear();
-      io.to(session.roomCode).emit('rematch_start', {
-        round: room.round, current: 'X', scores: room.scores
-      });
+      io.to(session.roomCode).emit('rematch_start', { round: room.round, current: 'X', scores: room.scores });
     }
   });
 
@@ -395,11 +364,7 @@ io.on('connection', (socket) => {
   socket.on('chat_msg', ({ text }) => {
     const session = sessions[socket.id];
     if (!session?.roomCode || !text?.trim()) return;
-    io.to(session.roomCode).emit('chat_msg', {
-      username: session.username,
-      symbol:   session.symbol,
-      text:     text.trim().slice(0, 120)
-    });
+    io.to(session.roomCode).emit('chat_msg', { username: session.username, symbol: session.symbol, text: text.trim().slice(0, 120) });
   });
 
   // ── Disconnect ──
@@ -409,31 +374,18 @@ io.on('connection', (socket) => {
 
     if (session?.roomCode) {
       const room = rooms[session.roomCode];
-
       if (room && session.userId && session.userId !== 'guest') {
-        // Start grace period — give the player time to reconnect
-        pendingReconnects[session.userId] = {
-          code:   session.roomCode,
-          symbol: session.symbol
-        };
-
-        socket.to(session.roomCode).emit('opponent_disconnected', {
-          username: session.username,
-          graceMs:  RECONNECT_GRACE_MS
-        });
-
+        pendingReconnects[session.userId] = { code: session.roomCode, symbol: session.symbol };
+        socket.to(session.roomCode).emit('opponent_disconnected', { username: session.username, graceMs: RECONNECT_GRACE_MS });
         disconnectTimers[session.userId] = setTimeout(() => {
           delete pendingReconnects[session.userId];
           delete disconnectTimers[session.userId];
           cleanupRoom(session.roomCode, { username: session.username });
         }, RECONNECT_GRACE_MS);
-
       } else {
-        // Guest — clean up immediately
         cleanupRoom(session.roomCode, { username: session.username });
       }
     }
-
     delete sessions[socket.id];
   });
 });
