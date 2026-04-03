@@ -836,7 +836,7 @@ input.field, textarea.field, .chat-input, .lobby-input {
     </div>
 
     <div style="text-align:center;margin-top:10px">
-      <button class="back-link" onclick="showSection('home')">← Back</button>
+      <button class="back-link" onclick="stopRoomCountdown();showSection('home')">← Back</button>
     </div>
   </div>
 </section>
@@ -1122,6 +1122,17 @@ function initSocket(){
     document.getElementById('roomCodeVal').textContent = code;
     document.getElementById('roomCodeBox').style.display = '';
     document.getElementById('createBtn').style.display = 'none';
+    // Start 5-min countdown so P1 knows how long the code is valid
+    startRoomCountdown(5 * 60);
+  });
+
+  socket.on('room_expired', ({code}) => {
+    stopRoomCountdown();
+    document.getElementById('createStatus').textContent = 'Room expired — no one joined in time.';
+    document.getElementById('createStatus').className = 'lobby-status err';
+    document.getElementById('roomCodeBox').style.display = 'none';
+    document.getElementById('createBtn').style.display = '';
+    showToast('Room code expired. Create a new one.');
   });
 
   socket.on('room_joined', ({code, symbol}) => {
@@ -1134,6 +1145,7 @@ function initSocket(){
   });
 
   socket.on('game_start', ({players, current}) => {
+    stopRoomCountdown();
     p1Name = players.X.username;
     p2Name = players.O.username;
     isOnline = true; mode = 'online';
@@ -1158,16 +1170,28 @@ function initSocket(){
       document.getElementById('resultIcon').textContent = '🏆';
       document.getElementById('resultMsg').textContent  = `${winName} wins!`;
       document.getElementById('resultSub').textContent  = `${p1Name} ${s.X} — ${s.O} ${p2Name}`;
+      document.getElementById('rematchWait').style.display='none';
       launchConfetti();
       setTimeout(()=>document.getElementById('resultOverlay').classList.add('show'),600);
+      // Update local user stats (optimistic)
+      if (currentUser && currentUser.id !== 'guest') {
+        if ((winner==='X'&&mySymbol==='X')||(winner==='O'&&mySymbol==='O')) currentUser.wins++;
+        else currentUser.losses++;
+        sessionStorage.setItem('ticxo_user',JSON.stringify(currentUser));
+      }
     } else {
-      showDrawToast();
-    }
-    // Update local user stats (optimistic)
-    if (currentUser && currentUser.id !== 'guest' && winner) {
-      if ((winner==='X'&&mySymbol==='X')||(winner==='O'&&mySymbol==='O')) currentUser.wins++;
-      else currentUser.losses++;
-      sessionStorage.setItem('ticxo_user',JSON.stringify(currentUser));
+      // Draw — in online mode show result overlay so rematch flow works correctly
+      // (do NOT auto-reset board; server controls the state)
+      document.getElementById('resultIcon').textContent = '🤝';
+      document.getElementById('resultMsg').textContent  = "It's a Draw!";
+      document.getElementById('resultSub').textContent  = `${p1Name} ${s.X} — ${s.O} ${p2Name}`;
+      document.getElementById('rematchWait').style.display='none';
+      setTimeout(()=>document.getElementById('resultOverlay').classList.add('show'),400);
+      // Update local user draws (optimistic)
+      if (currentUser && currentUser.id !== 'guest') {
+        currentUser.draws = (currentUser.draws || 0) + 1;
+        sessionStorage.setItem('ticxo_user',JSON.stringify(currentUser));
+      }
     }
   });
 
@@ -1195,6 +1219,50 @@ function initSocket(){
     setTimeout(()=>{ isOnline=false; exitGame(); }, 2500);
   });
 
+  socket.on('opponent_disconnected', ({username, graceMs}) => {
+    showToast(`${username} disconnected — waiting ${graceMs/1000}s for reconnect…`);
+  });
+
+  socket.on('opponent_reconnected', ({username}) => {
+    showToast(`${username} reconnected! ✅`);
+  });
+
+  socket.on('reconnected', ({code, symbol, board: b, current, scores: s, round, gameOver: go, players}) => {
+    mySymbol   = symbol;
+    myRoomCode = code;
+    isOnline   = true;
+    mode       = 'online';
+    p1Name     = players.X?.username || 'Player X';
+    p2Name     = players.O?.username || 'Player O';
+    board      = b;
+    currentPlayer = current;
+    scores     = s;
+    roundCount = round;
+    gameOver   = go;
+
+    // Restore game UI
+    document.getElementById('modeBadge').textContent = '🌐 Online';
+    document.getElementById('modeBadge').className   = 'chip chip-o';
+    document.getElementById('undoBtn').style.display  = 'none';
+    document.getElementById('chatWrap').style.display = '';
+    document.getElementById('chatMsgs').innerHTML    = '';
+    addChatMsg(null, null, 'You reconnected to the game!', true);
+
+    initGame(true);
+    // Redraw board state from server
+    const cells = document.querySelectorAll('.cell');
+    b.forEach((val, i) => {
+      if (val) {
+        cells[i].textContent = val;
+        cells[i].classList.add(val==='X'?'cx':'co','taken');
+      }
+    });
+    updateScoreboard();
+    updateTurnUI();
+    showSection('game');
+    showToast('Reconnected to your game! ✅');
+  });
+
   socket.on('chat_msg', ({username, symbol, text}) => {
     addChatMsg(username, symbol, text);
   });
@@ -1203,8 +1271,35 @@ function initSocket(){
 /* ══════════════════════════════════════════════
    LOBBY
 ══════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════
+   ROOM COUNTDOWN
+══════════════════════════════════════════════ */
+let _countdownTimer = null;
+function startRoomCountdown(seconds){
+  stopRoomCountdown();
+  const el = document.getElementById('createStatus');
+  function tick(){
+    if (seconds <= 0){
+      el.textContent = '';
+      return;
+    }
+    const m = Math.floor(seconds/60);
+    const s = String(seconds%60).padStart(2,'0');
+    el.textContent  = `Code valid for ${m}:${s}`;
+    el.className    = 'lobby-status' + (seconds <= 30 ? ' err' : '');
+    seconds--;
+    _countdownTimer = setTimeout(tick, 1000);
+  }
+  tick();
+}
+function stopRoomCountdown(){
+  clearTimeout(_countdownTimer);
+  _countdownTimer = null;
+}
+
 function goLobby(){
   if (!currentUser) { showSection('auth'); return; }
+  if (currentUser.id === 'guest') { showToast('Sign in to play online'); showSection('auth'); return; }
   document.getElementById('lobbyName').value = currentUser.username || '';
   document.getElementById('joinName').value  = currentUser.username || '';
   document.getElementById('roomCodeBox').style.display = 'none';
@@ -1221,9 +1316,17 @@ function switchLobbyTab(t){
   document.getElementById('joinPanel').classList.toggle('active',t==='join');
 }
 
+let _creatingRoom = false;
 function createRoom(){
+  if (_creatingRoom) return;
   const name = document.getElementById('lobbyName').value.trim() || currentUser.username || 'Player';
-  if (!socket?.connected) { showToast('Connecting…'); initSocket(); setTimeout(createRoom,800); return; }
+  if (!socket?.connected) {
+    showToast('Connecting…');
+    initSocket();
+    _creatingRoom = true;
+    setTimeout(()=>{ _creatingRoom=false; createRoom(); }, 800);
+    return;
+  }
   socket.emit('create_room',{userId:currentUser.id, username:name});
 }
 
@@ -1231,6 +1334,7 @@ function joinRoom(){
   const code = document.getElementById('roomCodeInput').value.trim().toUpperCase();
   const name = document.getElementById('joinName').value.trim() || currentUser.username || 'Player';
   if (!code||code.length!==4){ document.getElementById('joinErr').textContent='Enter a 4-letter code'; return; }
+  if (!socket?.connected){ document.getElementById('joinErr').textContent='Not connected — please wait…'; initSocket(); return; }
   document.getElementById('joinBtn').disabled = true;
   document.getElementById('joinErr').textContent = '';
   socket.emit('join_room',{code, userId:currentUser.id, username:name});
@@ -1280,6 +1384,7 @@ function startOnlineGame(startingPlayer){
   document.getElementById('modeBadge').className   = 'chip chip-o';
   document.getElementById('undoBtn').style.display  = 'none';
   document.getElementById('chatWrap').style.display = '';
+  document.getElementById('chatMsgs').innerHTML    = '';
   addChatMsg(null, null, 'Game started! Good luck!', true);
   showSection('game');
 }
@@ -1436,7 +1541,7 @@ function aiMove(){
   makeMove(mv); isAITurn=false;
 }
 function easyAI(){ const e=board.map((v,i)=>v?null:i).filter(v=>v!==null); return e[Math.floor(Math.random()*e.length)]; }
-function bestMove(){ let bv=-Infinity,bm=-1; for(let i=0;i<9;i++) if(!board[i]){board[i]='O';const v=minimax([...board],0,false);board[i]=null;if(v>bv){bv=v;bm=i;}} return bm; }
+function bestMove(){ let bv=-Infinity,bm=-1; for(let i=0;i<9;i++) if(!board[i]){const copy=[...board];copy[i]='O';const v=minimax(copy,0,false);if(v>bv){bv=v;bm=i;}} return bm; }
 function minimax(b,d,isMax){
   const r=cwb(b);
   if(r==='O') return 10-d;

@@ -9,16 +9,15 @@ const { Server } = require('socket.io');
 const path       = require('path');
 const fs         = require('fs');
 const crypto     = require('crypto');
+const bcrypt     = require('bcrypt');
+const rateLimit  = require('express-rate-limit');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-// On cloud hosts, PORT is set automatically by the platform.
-// Locally it defaults to 3000.
 const PORT = process.env.PORT || 3000;
 
-// Use /tmp for data on cloud (writable), local ./data folder otherwise
 const IS_CLOUD = !!process.env.RAILWAY_ENVIRONMENT ||
                  !!process.env.RENDER               ||
-                 !!process.env.DYNO;                 // Heroku
+                 !!process.env.DYNO;
 
 const DATA_DIR  = IS_CLOUD ? '/tmp' : path.join(__dirname, 'data');
 const DB_FILE   = path.join(DATA_DIR, 'users.json');
@@ -28,7 +27,6 @@ const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  // Keep connections alive through cloud proxies
   pingTimeout:  60000,
   pingInterval: 25000,
   transports: ['websocket', 'polling']
@@ -37,8 +35,16 @@ const io     = new Server(server, {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Health check — required by Railway/Render to confirm the app is running
 app.get('/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+// ─── Rate limiters ────────────────────────────────────────────────────────────
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many attempts. Please wait 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 // ─── Persistence helpers ─────────────────────────────────────────────────────
 function loadDB() {
@@ -61,19 +67,25 @@ function saveDB(db) {
 }
 
 // ─── In-memory game state ─────────────────────────────────────────────────────
-const rooms    = {};   // { [code]: room }
-const sessions = {};   // { [socketId]: session }
+const rooms             = {};   // { [code]: room }
+const sessions          = {};   // { [socketId]: session }
+const pendingReconnects = {};   // { [userId]: { code, symbol } }
+const disconnectTimers  = {};   // { [userId]: timeoutId }
+
+const RECONNECT_GRACE_MS = 15000;
+const ROOM_WAIT_MS       = 5 * 60 * 1000; // 5 minutes for Player 2 to join
 
 function makeRoom(code, p1) {
   return {
     code,
-    players:       { X: p1, O: null },
-    board:         Array(9).fill(null),
-    current:       'X',
-    gameOver:      false,
-    scores:        { X: 0, O: 0, D: 0 },
-    round:         1,
-    rematchVotes:  new Set()
+    players:      { X: p1, O: null },
+    board:        Array(9).fill(null),
+    current:      'X',
+    gameOver:     false,
+    scores:       { X: 0, O: 0, D: 0 },
+    round:        1,
+    rematchVotes: new Set(),
+    waitTimeout:  null  // cleared when P2 joins; fires after ROOM_WAIT_MS if still empty
   };
 }
 
@@ -92,38 +104,61 @@ function checkWinner(board) {
   return null;
 }
 
+function cleanupRoom(code, notifyPayload) {
+  const room = rooms[code];
+  if (!room) return;
+  if (notifyPayload) io.to(code).emit('opponent_left', notifyPayload);
+  delete rooms[code];
+  console.log(`Room ${code} deleted`);
+}
+
 // ─── REST: Auth ───────────────────────────────────────────────────────────────
-app.post('/api/signup', (req, res) => {
+app.post('/api/signup', authLimiter, async (req, res) => {
   const { username, password, avatar } = req.body;
+
   if (!username || !password)
     return res.status(400).json({ error: 'Username and password required' });
 
+  const trimmed = username.trim();
+  if (trimmed.length < 2 || trimmed.length > 24)
+    return res.status(400).json({ error: 'Username must be 2–24 characters' });
+  if (password.length < 4 || password.length > 128)
+    return res.status(400).json({ error: 'Password must be 4–128 characters' });
+
   const db  = loadDB();
-  const key = username.toLowerCase().trim();
+  const key = trimmed.toLowerCase();
 
   if (db.users[key])
     return res.status(409).json({ error: 'Username already taken' });
 
-  const hash = crypto.createHash('sha256').update(password).digest('hex');
-  db.users[key] = {
-    username:  username.trim(),
-    password:  hash,
-    avatar:    avatar || '🎮',
-    wins:      0,
-    losses:    0,
-    draws:     0,
-    createdAt: Date.now()
-  };
-  saveDB(db);
-
-  const { password: _, ...safe } = db.users[key];
-  res.json({ user: { ...safe, id: key } });
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    db.users[key] = {
+      username:  trimmed,
+      password:  hash,
+      avatar:    avatar || '🎮',
+      wins:      0,
+      losses:    0,
+      draws:     0,
+      createdAt: Date.now()
+    };
+    saveDB(db);
+    const { password: _, ...safe } = db.users[key];
+    res.json({ user: { ...safe, id: key } });
+  } catch (e) {
+    console.error('Signup error:', e.message);
+    res.status(500).json({ error: 'Server error. Try again.' });
+  }
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
+
   if (!username || !password)
     return res.status(400).json({ error: 'Fill in all fields' });
+
+  if (username.trim().length > 24 || password.length > 128)
+    return res.status(400).json({ error: 'Invalid credentials' });
 
   const db   = loadDB();
   const key  = username.toLowerCase().trim();
@@ -132,12 +167,32 @@ app.post('/api/login', (req, res) => {
   if (!user)
     return res.status(401).json({ error: 'User not found' });
 
-  const hash = crypto.createHash('sha256').update(password).digest('hex');
-  if (user.password !== hash)
-    return res.status(401).json({ error: 'Wrong password' });
+  try {
+    let match = false;
+    const isBcrypt = user.password.startsWith('$2');
 
-  const { password: _, ...safe } = user;
-  res.json({ user: { ...safe, id: key } });
+    if (isBcrypt) {
+      match = await bcrypt.compare(password, user.password);
+    } else {
+      // Legacy SHA-256 — migrate to bcrypt on first successful login
+      const sha = crypto.createHash('sha256').update(password).digest('hex');
+      match = sha === user.password;
+      if (match) {
+        user.password = await bcrypt.hash(password, 12);
+        saveDB(db);
+        console.log(`Migrated ${key} password to bcrypt`);
+      }
+    }
+
+    if (!match)
+      return res.status(401).json({ error: 'Wrong password' });
+
+    const { password: _, ...safe } = user;
+    res.json({ user: { ...safe, id: key } });
+  } catch (e) {
+    console.error('Login error:', e.message);
+    res.status(500).json({ error: 'Server error. Try again.' });
+  }
 });
 
 app.get('/api/leaderboard', (_req, res) => {
@@ -163,6 +218,39 @@ io.on('connection', (socket) => {
   socket.on('auth', ({ userId, username }) => {
     sessions[socket.id] = { userId, username, roomCode: null, symbol: null };
     socket.emit('auth_ok', { socketId: socket.id });
+
+    // ── Reconnect: restore player to their room if within grace period ──
+    if (userId && userId !== 'guest' && pendingReconnects[userId]) {
+      clearTimeout(disconnectTimers[userId]);
+      delete disconnectTimers[userId];
+
+      const { code, symbol } = pendingReconnects[userId];
+      delete pendingReconnects[userId];
+
+      const room = rooms[code];
+      if (room) {
+        sessions[socket.id] = { userId, username, roomCode: code, symbol };
+        room.players[symbol] = { socketId: socket.id, userId, username };
+        socket.join(code);
+
+        socket.emit('reconnected', {
+          code,
+          symbol,
+          board:    room.board,
+          current:  room.current,
+          scores:   room.scores,
+          round:    room.round,
+          gameOver: room.gameOver,
+          players: {
+            X: { username: room.players.X?.username, userId: room.players.X?.userId },
+            O: { username: room.players.O?.username, userId: room.players.O?.userId }
+          }
+        });
+
+        socket.to(code).emit('opponent_reconnected', { username });
+        console.log(`${username} reconnected to room ${code}`);
+      }
+    }
   });
 
   // ── Create room ──
@@ -171,12 +259,24 @@ io.on('connection', (socket) => {
     Object.assign(session, { userId, username });
     sessions[socket.id] = session;
 
+    // Generate a guaranteed 4-character alphanumeric code
+    const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I to avoid confusion
     let code;
-    do { code = Math.random().toString(36).substring(2,6).toUpperCase(); }
-    while (rooms[code]);
+    do {
+      code = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+    } while (rooms[code]);
 
     const room = makeRoom(code, { socketId: socket.id, userId, username });
     rooms[code] = room;
+
+    // Room expires in 5 minutes if Player 2 never joins
+    room.waitTimeout = setTimeout(() => {
+      if (rooms[code] && !rooms[code].players.O) {
+        socket.emit('room_expired', { code });
+        delete rooms[code];
+        console.log(`Room ${code} expired (no opponent joined within 5 min)`);
+      }
+    }, ROOM_WAIT_MS);
 
     session.roomCode = code;
     session.symbol   = 'X';
@@ -199,6 +299,8 @@ io.on('connection', (socket) => {
     sessions[socket.id] = session;
 
     room.players.O = { socketId: socket.id, userId, username };
+    // Cancel the waiting-room expiry — both players are now in
+    if (room.waitTimeout) { clearTimeout(room.waitTimeout); room.waitTimeout = null; }
     socket.join(upperCode);
 
     socket.emit('room_joined', { code: upperCode, symbol: 'O' });
@@ -306,17 +408,32 @@ io.on('connection', (socket) => {
     console.log(`- disconnected: ${socket.id}`);
 
     if (session?.roomCode) {
-      io.to(session.roomCode).emit('opponent_left', { username: session.username });
       const room = rooms[session.roomCode];
-      if (room) {
-        const otherSym    = session.symbol === 'X' ? 'O' : 'X';
-        const otherPlayer = room.players[otherSym];
-        if (!otherPlayer || !io.sockets.sockets.get(otherPlayer.socketId)) {
-          delete rooms[session.roomCode];
-          console.log(`Room ${session.roomCode} deleted (empty)`);
-        }
+
+      if (room && session.userId && session.userId !== 'guest') {
+        // Start grace period — give the player time to reconnect
+        pendingReconnects[session.userId] = {
+          code:   session.roomCode,
+          symbol: session.symbol
+        };
+
+        socket.to(session.roomCode).emit('opponent_disconnected', {
+          username: session.username,
+          graceMs:  RECONNECT_GRACE_MS
+        });
+
+        disconnectTimers[session.userId] = setTimeout(() => {
+          delete pendingReconnects[session.userId];
+          delete disconnectTimers[session.userId];
+          cleanupRoom(session.roomCode, { username: session.username });
+        }, RECONNECT_GRACE_MS);
+
+      } else {
+        // Guest — clean up immediately
+        cleanupRoom(session.roomCode, { username: session.username });
       }
     }
+
     delete sessions[socket.id];
   });
 });
