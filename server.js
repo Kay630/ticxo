@@ -1,17 +1,39 @@
+require('dotenv').config();
 /**
- * TicXO — Production-ready server
+ * TicXO — Production-ready server with MongoDB
  * Works locally AND on Railway, Render, Heroku, Fly.io etc.
- * Dependencies: express, socket.io only (built-in crypto handles passwords)
+ * Dependencies: express, socket.io, mongoose
  */
 
 const express    = require('express');
 const http       = require('http');
 const { Server } = require('socket.io');
 const path       = require('path');
-const fs         = require('fs');
 const crypto     = require('crypto');
+const mongoose   = require('mongoose');
 
-// ─── Password helpers (PBKDF2 — built into Node, no extra packages) ───────────
+// ─── MongoDB connection ───────────────────────────────────────────────────────
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/ticxo';
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => { console.error('❌ MongoDB connection error:', err.message); process.exit(1); });
+
+// ─── User schema ──────────────────────────────────────────────────────────────
+const userSchema = new mongoose.Schema({
+  _id:       String,           // username lowercase (e.g. "ken")
+  username:  String,           // display name (e.g. "Ken")
+  password:  String,
+  avatar:    { type: String, default: '🎮' },
+  wins:      { type: Number,  default: 0 },
+  losses:    { type: Number,  default: 0 },
+  draws:     { type: Number,  default: 0 },
+  createdAt: { type: Number,  default: () => Date.now() }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// ─── Password helpers ─────────────────────────────────────────────────────────
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex');
@@ -21,15 +43,13 @@ function verifyPassword(password, stored) {
   if (stored.startsWith('pbkdf2:')) {
     const [, salt, hash] = stored.split(':');
     const attempt = crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex');
-    // timingSafeEqual prevents timing attacks
     return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(attempt, 'hex'));
   }
-  // Legacy SHA-256 accounts (migrate on next login)
   const sha = crypto.createHash('sha256').update(password).digest('hex');
   return sha === stored;
 }
 
-// ─── Simple in-memory rate limiter (no external package needed) ───────────────
+// ─── Simple in-memory rate limiter ───────────────────────────────────────────
 const _rateBuckets = {};
 function rateLimiter(maxHits, windowMs) {
   return (req, res, next) => {
@@ -45,17 +65,10 @@ function rateLimiter(maxHits, windowMs) {
 }
 const authLimiter = rateLimiter(20, 15 * 60 * 1000);
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-const IS_CLOUD = !!process.env.RAILWAY_ENVIRONMENT ||
-                 !!process.env.RENDER               ||
-                 !!process.env.DYNO;
-
-const DATA_DIR = IS_CLOUD ? '/tmp' : path.join(__dirname, 'data');
-const DB_FILE  = path.join(DATA_DIR, 'users.json');
-
-// ─── App setup ───────────────────────────────────────────────────────────────
+// ─── App setup ────────────────────────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
@@ -69,22 +82,6 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-
-// ─── Persistence helpers ─────────────────────────────────────────────────────
-function loadDB() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (!fs.existsSync(DB_FILE))  fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }));
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch (e) {
-    console.error('DB load error:', e.message);
-    return { users: {} };
-  }
-}
-function saveDB(db) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
-  catch (e) { console.error('DB save error:', e.message); }
-}
 
 // ─── In-memory game state ─────────────────────────────────────────────────────
 const rooms             = {};
@@ -132,7 +129,7 @@ function cleanupRoom(code, notifyPayload) {
 }
 
 // ─── REST: Auth ───────────────────────────────────────────────────────────────
-app.post('/api/signup', authLimiter, (req, res) => {
+app.post('/api/signup', authLimiter, async (req, res) => {
   const { username, password, avatar } = req.body;
 
   if (!username || !password)
@@ -144,28 +141,29 @@ app.post('/api/signup', authLimiter, (req, res) => {
   if (password.length < 4 || password.length > 128)
     return res.status(400).json({ error: 'Password must be 4–128 characters' });
 
-  const db  = loadDB();
   const key = trimmed.toLowerCase();
 
-  if (db.users[key])
-    return res.status(409).json({ error: 'Username already taken' });
+  try {
+    const existing = await User.findById(key);
+    if (existing)
+      return res.status(409).json({ error: 'Username already taken' });
 
-  db.users[key] = {
-    username:  trimmed,
-    password:  hashPassword(password),
-    avatar:    avatar || '🎮',
-    wins:      0,
-    losses:    0,
-    draws:     0,
-    createdAt: Date.now()
-  };
-  saveDB(db);
+    const newUser = await User.create({
+      _id:      key,
+      username: trimmed,
+      password: hashPassword(password),
+      avatar:   avatar || '🎮',
+    });
 
-  const { password: _, ...safe } = db.users[key];
-  res.json({ user: { ...safe, id: key } });
+    const { password: _, ...safe } = newUser.toObject();
+    res.json({ user: { ...safe, id: key } });
+  } catch (e) {
+    console.error('Signup error:', e.message);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
 });
 
-app.post('/api/login', authLimiter, (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password)
@@ -173,34 +171,53 @@ app.post('/api/login', authLimiter, (req, res) => {
   if (username.trim().length > 24 || password.length > 128)
     return res.status(400).json({ error: 'Invalid credentials' });
 
-  const db   = loadDB();
-  const key  = username.toLowerCase().trim();
-  const user = db.users[key];
+  const key = username.toLowerCase().trim();
 
-  if (!user)
-    return res.status(401).json({ error: 'User not found' });
+  try {
+    const user = await User.findById(key);
 
-  if (!verifyPassword(password, user.password))
-    return res.status(401).json({ error: 'Wrong password' });
+    if (!user)
+      return res.status(401).json({ error: 'User not found' });
 
-  // Migrate legacy SHA-256 hash to PBKDF2 on first successful login
-  if (!user.password.startsWith('pbkdf2:')) {
-    user.password = hashPassword(password);
-    saveDB(db);
-    console.log(`Migrated ${key} to PBKDF2`);
+    if (!verifyPassword(password, user.password))
+      return res.status(401).json({ error: 'Wrong password' });
+
+    // Migrate legacy SHA-256 to PBKDF2
+    if (!user.password.startsWith('pbkdf2:')) {
+      user.password = hashPassword(password);
+      await user.save();
+      console.log(`Migrated ${key} to PBKDF2`);
+    }
+
+    const { password: _, ...safe } = user.toObject();
+    res.json({ user: { ...safe, id: key } });
+  } catch (e) {
+    console.error('Login error:', e.message);
+    res.status(500).json({ error: 'Server error. Please try again.' });
   }
-
-  const { password: _, ...safe } = user;
-  res.json({ user: { ...safe, id: key } });
 });
 
-app.get('/api/leaderboard', (_req, res) => {
-  const db = loadDB();
-  const board = Object.entries(db.users)
-    .map(([id, u]) => ({ id, username: u.username, avatar: u.avatar, wins: u.wins, losses: u.losses, draws: u.draws }))
-    .sort((a, b) => b.wins - a.wins || a.losses - b.losses)
-    .slice(0, 20);
-  res.json({ leaderboard: board });
+app.get('/api/leaderboard', async (_req, res) => {
+  try {
+    const users = await User.find({})
+      .sort({ wins: -1, losses: 1 })
+      .limit(20)
+      .select('-password');
+
+    const leaderboard = users.map(u => ({
+      id:       u._id,
+      username: u.username,
+      avatar:   u.avatar,
+      wins:     u.wins,
+      losses:   u.losses,
+      draws:    u.draws
+    }));
+
+    res.json({ leaderboard });
+  } catch (e) {
+    console.error('Leaderboard error:', e.message);
+    res.status(500).json({ error: 'Could not fetch leaderboard.' });
+  }
 });
 
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
@@ -211,7 +228,6 @@ io.on('connection', (socket) => {
     sessions[socket.id] = { userId, username, roomCode: null, symbol: null };
     socket.emit('auth_ok', { socketId: socket.id });
 
-    // Reconnect within grace period
     if (userId && userId !== 'guest' && pendingReconnects[userId]) {
       clearTimeout(disconnectTimers[userId]);
       delete disconnectTimers[userId];
@@ -242,7 +258,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── Create room ──
   socket.on('create_room', ({ userId, username }) => {
     const session = sessions[socket.id] || {};
     Object.assign(session, { userId, username });
@@ -273,7 +288,6 @@ io.on('connection', (socket) => {
     console.log(`Room ${code} created by ${username}`);
   });
 
-  // ── Join room ──
   socket.on('join_room', ({ code, userId, username }) => {
     const upperCode = code?.toUpperCase();
     const room      = rooms[upperCode];
@@ -300,8 +314,7 @@ io.on('connection', (socket) => {
     console.log(`${username} joined room ${upperCode}`);
   });
 
-  // ── Make move ──
-  socket.on('make_move', ({ index }) => {
+  socket.on('make_move', async ({ index }) => {
     const session = sessions[socket.id];
     if (!session?.roomCode) return;
     const room = rooms[session.roomCode];
@@ -314,24 +327,26 @@ io.on('connection', (socket) => {
 
     if (result) {
       room.gameOver = true;
+
       if (result.winner) {
         room.scores[result.winner]++;
-        const db = loadDB();
         const winPlayer  = room.players[result.winner];
         const loseSym    = result.winner === 'X' ? 'O' : 'X';
         const losePlayer = room.players[loseSym];
-        if (winPlayer?.userId  && db.users[winPlayer.userId])  db.users[winPlayer.userId].wins++;
-        if (losePlayer?.userId && db.users[losePlayer.userId]) db.users[losePlayer.userId].losses++;
-        saveDB(db);
+
+        if (winPlayer?.userId  && winPlayer.userId  !== 'guest')
+          User.findByIdAndUpdate(winPlayer.userId,  { $inc: { wins:   1 } }).catch(console.error);
+        if (losePlayer?.userId && losePlayer.userId !== 'guest')
+          User.findByIdAndUpdate(losePlayer.userId, { $inc: { losses: 1 } }).catch(console.error);
       } else {
         room.scores.D++;
-        const db = loadDB();
         for (const sym of ['X', 'O']) {
           const p = room.players[sym];
-          if (p?.userId && db.users[p.userId]) db.users[p.userId].draws++;
+          if (p?.userId && p.userId !== 'guest')
+            User.findByIdAndUpdate(p.userId, { $inc: { draws: 1 } }).catch(console.error);
         }
-        saveDB(db);
       }
+
       io.to(session.roomCode).emit('move_made', { index, symbol: session.symbol, board: room.board });
       io.to(session.roomCode).emit('game_over', { winner: result.winner, line: result.line || null, scores: room.scores, round: room.round });
     } else {
@@ -340,7 +355,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── Rematch ──
   socket.on('rematch', () => {
     const session = sessions[socket.id];
     if (!session?.roomCode) return;
@@ -360,14 +374,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── Chat ──
   socket.on('chat_msg', ({ text }) => {
     const session = sessions[socket.id];
     if (!session?.roomCode || !text?.trim()) return;
     io.to(session.roomCode).emit('chat_msg', { username: session.username, symbol: session.symbol, text: text.trim().slice(0, 120) });
   });
 
-  // ── Disconnect ──
   socket.on('disconnect', () => {
     const session = sessions[socket.id];
     console.log(`- disconnected: ${socket.id}`);
@@ -392,7 +404,5 @@ io.on('connection', (socket) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🎮 TicXO running → http://localhost:${PORT}`);
-  console.log(`   Environment: ${IS_CLOUD ? 'cloud ☁️' : 'local 💻'}`);
-  console.log(`   Data file:   ${DB_FILE}\n`);
+  console.log(`\n🎮 TicXO running → http://localhost:${PORT}\n`);
 });
