@@ -9,7 +9,7 @@ const { Server } = require('socket.io');
 const path       = require('path');
 const fs         = require('fs');
 const crypto     = require('crypto');
-const bcrypt     = require('bcrypt');
+const bcrypt     = require('bcryptjs'); // pure-JS build, no native compilation needed
 const rateLimit  = require('express-rate-limit');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
