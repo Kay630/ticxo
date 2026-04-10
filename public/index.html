@@ -1182,20 +1182,27 @@ function initSocket(){
         else currentUser.losses++;
         sessionStorage.setItem('ticxo_user',JSON.stringify(currentUser));
       }
-    } else {
-      // Draw — in online mode show result overlay so rematch flow works correctly
-      // (do NOT auto-reset board; server controls the state)
-      document.getElementById('resultIcon').textContent = '🤝';
-      document.getElementById('resultMsg').textContent  = "It's a Draw!";
-      document.getElementById('resultSub').textContent  = `${p1Name} ${s.X} — ${s.O} ${p2Name}`;
-      document.getElementById('rematchWait').style.display='none';
-      setTimeout(()=>document.getElementById('resultOverlay').classList.add('show'),400);
-      // Update local user draws (optimistic)
-      if (currentUser && currentUser.id !== 'guest') {
-        currentUser.draws = (currentUser.draws || 0) + 1;
-        sessionStorage.setItem('ticxo_user',JSON.stringify(currentUser));
-      }
     }
+  });
+
+  // Draw — server auto-continues: show a brief toast then reset the board
+  socket.on('draw_auto_next', ({scores: s, round, current}) => {
+    scores = s; roundCount = round;
+    updateScoreboard();
+    if (currentUser && currentUser.id !== 'guest') {
+      currentUser.draws = (currentUser.draws || 0) + 1;
+      sessionStorage.setItem('ticxo_user', JSON.stringify(currentUser));
+    }
+    // Show the draw toast briefly, then kick off the new round
+    const nextName = current === 'X' ? p1Name : p2Name;
+    showToast(`🤝 Draw! Round ${round} — ${nextName} goes first`);
+    setTimeout(() => {
+      resetBoardUI();
+      gameOver    = false;
+      currentPlayer = current;
+      updateTurnUI();
+      document.getElementById('roundNum').textContent = round;
+    }, 1800);
   });
 
   socket.on('rematch_vote', ({count}) => {

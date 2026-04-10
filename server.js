@@ -98,6 +98,7 @@ function makeRoom(code, p1) {
     players:      { X: p1, O: null },
     board:        Array(9).fill(null),
     current:      'X',
+    startedWith:  'X',   // tracks who opened each round (swaps on draw)
     gameOver:     false,
     scores:       { X: 0, O: 0, D: 0 },
     round:        1,
@@ -339,12 +340,31 @@ io.on('connection', (socket) => {
         if (losePlayer?.userId && losePlayer.userId !== 'guest')
           User.findByIdAndUpdate(losePlayer.userId, { $inc: { losses: 1 } }).catch(console.error);
       } else {
+        // Draw — auto-continue, swap who starts next round (no pause, no rematch prompt)
         room.scores.D++;
         for (const sym of ['X', 'O']) {
           const p = room.players[sym];
           if (p?.userId && p.userId !== 'guest')
             User.findByIdAndUpdate(p.userId, { $inc: { draws: 1 } }).catch(console.error);
         }
+
+        // Show the completing move first, then signal auto-reset
+        io.to(session.roomCode).emit('move_made', { index, symbol: session.symbol, board: room.board });
+
+        // Swap the starter and reset for next round
+        room.startedWith = room.startedWith === 'X' ? 'O' : 'X';
+        room.board    = Array(9).fill(null);
+        room.current  = room.startedWith;
+        room.gameOver = false;
+        room.round++;
+        room.rematchVotes.clear();
+
+        io.to(session.roomCode).emit('draw_auto_next', {
+          scores:  room.scores,
+          round:   room.round,
+          current: room.current   // who starts the new round
+        });
+        return;  // skip winner emits
       }
 
       io.to(session.roomCode).emit('move_made', { index, symbol: session.symbol, board: room.board });
